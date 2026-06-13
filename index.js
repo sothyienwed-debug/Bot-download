@@ -1,4 +1,4 @@
-﻿import { spawn } from "child_process";
+import { spawn } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import { promises as fsp } from "fs";
@@ -196,6 +196,16 @@ function extractDouyinVideoId(url) {
     url.match(/douyin\.com\/video\/(\d+)(?:[/?#]|$)/i)?.[1] ||
     url.match(/iesdouyin\.com\/share\/video\/(\d+)(?:[/?#]|$)/i)?.[1];
 
+  return videoId || null;
+}
+
+function isTikTokUrl(url) {
+  return /(?:^|\/\/)(?:(?:www|vm|vt|m)\.)?tiktok\.com\//i.test(url);
+}
+
+function extractTikTokVideoId(url) {
+  if (typeof url !== "string") return null;
+  const videoId = url.match(/\/video\/(\d+)/i)?.[1];
   return videoId || null;
 }
 
@@ -910,6 +920,219 @@ async function getKuaishouFallbackSources(pageUrl) {
   throw lastError || new Error("Kuaishou fallback did not find a downloadable source.");
 }
 
+const TIKTOK_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+};
+
+function extractTikTokSourcesFromHtml(html) {
+  // Try __UNIVERSAL_DATA_FOR_REHYDRATION__ first
+  const rehydrationMatch = html.match(
+    /<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/i
+  );
+
+  let videoDetail = null;
+
+  if (rehydrationMatch) {
+    try {
+      const rehydrationData = JSON.parse(rehydrationMatch[1]);
+      const defaultScope = rehydrationData?.__DEFAULT_SCOPE__ || rehydrationData;
+
+      // Navigate the data structure to find video detail
+      const videoDetailEntry = defaultScope?.["webapp.video-detail"];
+      videoDetail =
+        videoDetailEntry?.itemInfo?.itemStruct ||
+        videoDetailEntry?.itemStruct ||
+        null;
+
+      // Also try searching through all keys for video data
+      if (!videoDetail) {
+        for (const key of Object.keys(defaultScope || {})) {
+          const entry = defaultScope[key];
+          if (entry?.itemInfo?.itemStruct?.video) {
+            videoDetail = entry.itemInfo.itemStruct;
+            break;
+          }
+          if (entry?.itemStruct?.video) {
+            videoDetail = entry.itemStruct;
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      log(`[fallback] TikTok rehydration data parse failed: ${error.message}`);
+    }
+  }
+
+  // Try SIGI_STATE as a legacy fallback
+  if (!videoDetail) {
+    const sigiMatch = html.match(
+      /<script\s+id="SIGI_STATE"[^>]*>([\s\S]*?)<\/script>/i
+    );
+    if (sigiMatch) {
+      try {
+        const sigiData = JSON.parse(sigiMatch[1]);
+        const itemModule = sigiData?.ItemModule || {};
+        const firstKey = Object.keys(itemModule)[0];
+        if (firstKey) {
+          videoDetail = itemModule[firstKey];
+        }
+      } catch (error) {
+        log(`[fallback] TikTok SIGI_STATE parse failed: ${error.message}`);
+      }
+    }
+  }
+
+  // Try generic JSON-LD or script-based video URL extraction
+  if (!videoDetail) {
+    const jsonLdMatch = html.match(
+      /<script\s+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i
+    );
+    if (jsonLdMatch) {
+      try {
+        const jsonLd = JSON.parse(jsonLdMatch[1]);
+        const contentUrl = jsonLd?.contentUrl || jsonLd?.url;
+        if (contentUrl && contentUrl.startsWith("http")) {
+          return {
+            sources: [{ label: "Default", directUrl: contentUrl, headers: TIKTOK_HEADERS }],
+            thumbnailUrl: jsonLd?.thumbnailUrl?.[0] || jsonLd?.thumbnail || null,
+          };
+        }
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  if (!videoDetail?.video) {
+    throw new Error("TikTok fallback could not find video data in page HTML.");
+  }
+
+  const video = videoDetail.video;
+  const sources = [];
+  const seen = new Set();
+
+  const addSource = (label, url) => {
+    if (!url || typeof url !== "string" || !url.startsWith("http")) return;
+    if (seen.has(url)) return;
+    seen.add(url);
+    sources.push({ label, directUrl: url, headers: TIKTOK_HEADERS });
+  };
+
+  // Try downloadAddr first (no watermark in some cases)
+  if (video.downloadAddr) {
+    addSource("HD", video.downloadAddr);
+  }
+
+  // playAddr is the main play URL
+  if (video.playAddr) {
+    addSource("Play", video.playAddr);
+  }
+
+  // Try bitrateInfo for multiple quality levels
+  if (Array.isArray(video.bitrateInfo)) {
+    for (const bitrate of video.bitrateInfo) {
+      const playUrl = bitrate?.PlayAddr?.UrlList?.[0] || bitrate?.playAddr;
+      const qualityType = bitrate?.QualityType || bitrate?.GearName || "";
+      const height = bitrate?.PlayAddr?.Height || bitrate?.height || 0;
+      const label = height ? `${height}p` : (qualityType || "Default");
+      addSource(label, playUrl);
+    }
+  }
+
+  // Try play_addr url_list (similar to Douyin structure)
+  if (video.play_addr?.url_list) {
+    for (const url of video.play_addr.url_list) {
+      addSource("Play", url);
+    }
+  }
+  if (video.download_addr?.url_list) {
+    for (const url of video.download_addr.url_list) {
+      addSource("HD", url);
+    }
+  }
+
+  if (sources.length === 0) {
+    throw new Error("TikTok fallback found video data but no playable URL.");
+  }
+
+  // Extract thumbnail
+  const coverUrl =
+    video.cover ||
+    video.originCover ||
+    video.dynamicCover ||
+    (Array.isArray(video.cover_url_list) ? video.cover_url_list[0] : null) ||
+    null;
+
+  return {
+    sources,
+    thumbnailUrl: typeof coverUrl === "string" && coverUrl.startsWith("http") ? coverUrl : null,
+  };
+}
+
+async function getTikTokFallbackSources(inputUrl, finalUrl) {
+  const candidates = [];
+
+  // Build candidate URLs to try
+  const videoId = extractTikTokVideoId(finalUrl) || extractTikTokVideoId(inputUrl);
+
+  // If we have a full URL with /video/, use it
+  if (finalUrl && /\/video\/\d+/i.test(finalUrl)) {
+    candidates.push(finalUrl);
+  }
+  if (inputUrl && /\/video\/\d+/i.test(inputUrl) && inputUrl !== finalUrl) {
+    candidates.push(inputUrl);
+  }
+
+  // Also try short link URLs directly (vt.tiktok.com, vm.tiktok.com)
+  if (inputUrl && /(?:vt|vm)\.tiktok\.com/i.test(inputUrl)) {
+    candidates.push(inputUrl);
+  }
+  if (finalUrl && finalUrl !== inputUrl) {
+    candidates.push(finalUrl);
+  }
+
+  // Deduplicate
+  const uniqueCandidates = [...new Set(candidates)];
+
+  if (uniqueCandidates.length === 0) {
+    throw new Error("TikTok fallback could not determine a page URL to fetch.");
+  }
+
+  let lastError = null;
+
+  for (const candidateUrl of uniqueCandidates) {
+    try {
+      log(`[fallback] TikTok page parse start: ${candidateUrl}`);
+      const response = await axios({
+        method: "GET",
+        url: candidateUrl,
+        timeout: REDIRECT_TIMEOUT_MS,
+        maxRedirects: 10,
+        headers: TIKTOK_HEADERS,
+        validateStatus: () => true,
+      });
+
+      if (response.status >= 400 || typeof response.data !== "string") {
+        throw new Error(`TikTok fallback page fetch failed (status ${response.status}).`);
+      }
+
+      const extracted = extractTikTokSourcesFromHtml(response.data);
+      log(`[fallback] TikTok video URL extracted (${extracted.sources.length} source(s)).`);
+      return extracted;
+    } catch (error) {
+      lastError = error;
+      log(`[fallback] TikTok candidate failed for ${candidateUrl}: ${error.message}`);
+    }
+  }
+
+  throw lastError || new Error("TikTok fallback could not extract a playable video.");
+}
+
 function shouldUseCookies(url) {
   if (!COOKIES_FROM_BROWSER || cookiesTemporarilyDisabled) return false;
   return /(facebook\.com|fb\.watch|instagram\.com|douyin\.com|iesdouyin\.com|tiktok\.com)/i.test(url);
@@ -1553,6 +1776,7 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
     log(`[message] finalUrl=${finalUrl}`);
     const shouldTryKuaishouFallback = isKuaishouUrl(extractedUrl) || isKuaishouUrl(finalUrl);
     const shouldTryDouyinFallback = isDouyinUrl(extractedUrl) || isDouyinUrl(finalUrl);
+    const shouldTryTikTokFallback = isTikTokUrl(extractedUrl) || isTikTokUrl(finalUrl);
 
     const checkingMessage = await bot.sendMessage(chatId, "Checking available qualities...");
     transientMessageIds.push(checkingMessage.message_id);
@@ -1588,6 +1812,16 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
         }
         sourceType = "direct";
       }
+
+      if (choices.length === 0 && shouldTryTikTokFallback) {
+        log("[fallback] Triggered for TikTok URL with empty yt-dlp quality list.");
+        const { sources, thumbnailUrl } = await getTikTokFallbackSources(extractedUrl, finalUrl);
+        choices = mapDirectSourcesToChoices(sources);
+        if (!previewImageUrl) {
+          previewImageUrl = thumbnailUrl;
+        }
+        sourceType = "direct";
+      }
     } catch (error) {
       const errorText = error?.stack || error?.message || String(error);
       if (isUnsupportedUrlError(errorText) && shouldTryKuaishouFallback) {
@@ -1609,6 +1843,12 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
         choices = mapDirectSourcesToChoices(sources);
         previewImageUrl = thumbnailUrl;
         sourceType = "direct";
+      } else if (shouldTryTikTokFallback) {
+        log("[fallback] Triggered for TikTok URL after yt-dlp failure.");
+        const { sources, thumbnailUrl } = await getTikTokFallbackSources(extractedUrl, finalUrl);
+        choices = mapDirectSourcesToChoices(sources);
+        previewImageUrl = thumbnailUrl;
+        sourceType = "direct";
       } else {
         throw error;
       }
@@ -1625,6 +1865,11 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
         await bot.sendMessage(
           chatId,
           "No downloadable video stream found for this Douyin link (it may be photo-only, private, or region-limited)."
+        );
+      } else if (shouldTryTikTokFallback) {
+        await bot.sendMessage(
+          chatId,
+          "No downloadable video stream found for this TikTok link (it may be private, removed, or region-limited)."
         );
       } else {
         await bot.sendMessage(chatId, "No downloadable quality options found for this link.");
